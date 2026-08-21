@@ -1,6 +1,8 @@
+import importlib
 import math
 
 import qwiic_icm20948
+import qwiic_i2c
 import rclpy
 import sensor_msgs.msg
 from rclpy.node import Node
@@ -14,6 +16,10 @@ class ICM20948Node(Node):
         self.logger = self.get_logger()
 
         # Parameters
+        self.declare_parameter("i2c_bus", 1)
+        i2c_bus = self.get_parameter("i2c_bus").get_parameter_value().integer_value
+        self.i2c_bus = i2c_bus
+
         self.declare_parameter("i2c_address", 0x69)
         i2c_addr = self.get_parameter("i2c_address").get_parameter_value().integer_value
         self.i2c_addr = i2c_addr
@@ -27,12 +33,16 @@ class ICM20948Node(Node):
         self.pub_rate = pub_rate
 
         # IMU instance
-        self.imu = qwiic_icm20948.QwiicIcm20948(address=self.i2c_addr)
-        if not self.imu.connected:
-            self.logger.info(
-                "The Qwiic ICM20948 device isn't connected to the system. Please check your connection."
+        i2c_driver = self._get_i2c_driver(self.i2c_bus)
+        self.imu = qwiic_icm20948.QwiicIcm20948(
+            address=self.i2c_addr,
+            i2c_driver=i2c_driver,
+        )
+        if not self.imu.begin():
+            raise RuntimeError(
+                "Failed to initialize ICM20948 on "
+                f"I2C bus {self.i2c_bus} at address 0x{self.i2c_addr:02X}."
             )
-        self.imu.begin()
         self.imu.setFullScaleRangeGyro(qwiic_icm20948.dps2000)
         self.imu.setFullScaleRangeAccel(qwiic_icm20948.gpm16)
 
@@ -42,6 +52,63 @@ class ICM20948Node(Node):
             sensor_msgs.msg.MagneticField, "/imu/mag_raw", 10
         )
         self.pub_clk_ = self.create_timer(1 / self.pub_rate, self.publish_cback)
+
+    def _get_i2c_driver(self, i2c_bus):
+        if hasattr(qwiic_i2c, "get_i2c_driver"):
+            i2c_driver = qwiic_i2c.get_i2c_driver(iBus=i2c_bus)
+            return self._require_i2c_driver(i2c_driver, i2c_bus)
+
+        if hasattr(qwiic_i2c, "getI2CDriver"):
+            try:
+                i2c_driver = qwiic_i2c.getI2CDriver(iBus=i2c_bus)
+                return self._require_i2c_driver(i2c_driver, i2c_bus)
+            except TypeError as exc:
+                i2c_driver = self._get_legacy_linux_i2c_driver(i2c_bus)
+                if i2c_driver is not None:
+                    return i2c_driver
+
+                raise RuntimeError(
+                    "Installed qwiic_i2c does not expose I2C bus selection. "
+                    "Upgrade sparkfun-qwiic-i2c, or patch qwiic_i2c to use bus "
+                    f"{i2c_bus}."
+                ) from exc
+
+        raise RuntimeError("Unable to find a SparkFun qwiic_i2c driver factory.")
+
+    def _get_legacy_linux_i2c_driver(self, i2c_bus):
+        if not hasattr(qwiic_i2c, "LinuxI2C"):
+            return None
+
+        if hasattr(qwiic_i2c, "_theDriver"):
+            qwiic_i2c._theDriver = None
+
+        linux_i2c = importlib.import_module(qwiic_i2c.LinuxI2C.__module__)
+
+        # Older qwiic_i2c releases hard-code bus 1 inside this connection helper.
+        def connect_to_selected_bus():
+            try:
+                import smbus2
+            except Exception as exc:
+                raise RuntimeError(
+                    "Unable to load smbus2 for SparkFun I2C."
+                ) from exc
+
+            try:
+                return smbus2.SMBus(i2c_bus)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to connect to I2C bus {i2c_bus}."
+                ) from exc
+
+        linux_i2c._connectToI2CBus = connect_to_selected_bus
+        return self._require_i2c_driver(qwiic_i2c.LinuxI2C(), i2c_bus)
+
+    def _require_i2c_driver(self, i2c_driver, i2c_bus):
+        if i2c_driver is None:
+            raise RuntimeError(
+                f"Unable to create SparkFun I2C driver for bus {i2c_bus}."
+            )
+        return i2c_driver
 
     def publish_cback(self):
         imu_msg = sensor_msgs.msg.Imu()

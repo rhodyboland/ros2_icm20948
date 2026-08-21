@@ -17,6 +17,7 @@ setup(
     install_requires=[
         "setuptools",
         "sparkfun-qwiic-icm20948",
+        "sparkfun-qwiic-i2c",
     ],
     zip_safe=True,
     maintainer="Simon-Pierre Deschênes",
